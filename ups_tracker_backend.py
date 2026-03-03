@@ -644,61 +644,122 @@ def _parse_postnl_public(data, tn, postalCode):
 LAPOSTE_API_KEY = os.environ.get("LAPOSTE_API_KEY", "").strip()
 
 def track_chronopost(tn, postalCode=""):
-    """Track Chronopost/Colissimo via La Poste Suivi v2 API with fallback."""
-    print(f"\n📊 Chronopost/LaPoste {tn} key={'YES' if LAPOSTE_API_KEY else 'NO'}")
+    """Track Chronopost via ws.chronopost.fr TrackingServiceWS (free, no API key)."""
+    print(f"\n📊 Chronopost {tn}")
     
-    # Method 1: La Poste Suivi v2 API
-    if LAPOSTE_API_KEY:
-        try:
-            headers = {
-                "Accept": "application/json",
-                "X-Okapi-Key": LAPOSTE_API_KEY,
-            }
-            url = f"https://api.laposte.fr/suivi/v2/idships/{tn}?lang=fr_FR"
-            r = requests.get(url, headers=headers, timeout=15)
-            print(f"📬 LaPoste API: {r.status_code} body={r.text[:500]}")
-            
-            if r.status_code == 200 and r.text.strip().startswith("{"):
-                data = r.json()
-                shipment = data.get("shipment", {})
-                if shipment:
-                    return _parse_laposte_v2(shipment, tn)
-                elif data.get("returnCode"):
-                    print(f"📬 LaPoste returnCode: {data.get('returnCode')} {data.get('returnMessage','')}")
-            elif r.status_code == 401:
-                print(f"📬 LaPoste 401 - clé invalide ou expirée")
-            elif r.status_code == 400:
-                print(f"📬 LaPoste 400 - numéro invalide: {r.text[:200]}")
-            else:
-                print(f"📬 LaPoste error: {r.status_code}")
-        except Exception as e:
-            print(f"📬 LaPoste exception: {e}")
-    
-    # Method 2: Chronopost direct tracking (public SOAP → JSON)
+    # Method 1: Chronopost official tracking WS (GET endpoint, no auth needed)
     try:
-        chrono_url = f"https://www.chronopost.fr/tracking-no-498/suivi-page?listeNumeros={tn}&langue=fr"
-        headers2 = {
-            "Accept": "application/json, text/html",
+        url = f"https://ws.chronopost.fr/tracking-cxf/TrackingServiceWS/trackSkybillV2?language=fr_FR&skybillNumber={tn}"
+        headers = {
+            "Accept": "application/json, text/xml, */*",
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
         }
-        # Chronopost public JSON API
-        api_url = f"https://www.chronopost.fr/tracking-cxf/TrackingServiceWS/trackSkybill?language=fr_FR&skybillNumber={tn}"
-        r2 = requests.get(api_url, headers=headers2, timeout=15)
-        print(f"📬 Chronopost direct: {r2.status_code} ct={r2.headers.get('content-type','')} body={r2.text[:300]}")
+        r = requests.get(url, headers=headers, timeout=15)
+        print(f"📬 Chronopost WS: {r.status_code} ct={r.headers.get('content-type','')} body={r.text[:500]}")
         
-        if r2.status_code == 200 and r2.text.strip().startswith(("{","<")):
-            # Try JSON parse
-            try:
-                data2 = r2.json()
-                return _parse_chronopost_direct(data2, tn)
-            except:
-                pass
+        if r.status_code == 200:
+            # Response is XML (SOAP) - parse it
+            if "<" in r.text:
+                return _parse_chronopost_xml(r.text, tn)
+            # Or JSON
+            elif r.text.strip().startswith("{"):
+                data = r.json()
+                return _parse_chronopost_direct(data, tn)
     except Exception as e:
-        print(f"📬 Chronopost direct exception: {e}")
+        print(f"📬 Chronopost WS exception: {e}")
     
-    if not LAPOSTE_API_KEY:
-        raise HTTPException(500, "Clé API La Poste manquante (LAPOSTE_API_KEY). Configurez-la dans Railway.")
-    raise HTTPException(502, f"Chronopost/LaPoste: impossible de récupérer le suivi pour {tn}")
+    # Method 2: La Poste Suivi v2 (backup, needs LAPOSTE_API_KEY)
+    if LAPOSTE_API_KEY:
+        try:
+            headers2 = {"Accept": "application/json", "X-Okapi-Key": LAPOSTE_API_KEY}
+            r2 = requests.get(f"https://api.laposte.fr/suivi/v2/idships/{tn}?lang=fr_FR",
+                              headers=headers2, timeout=15)
+            print(f"📬 LaPoste backup: {r2.status_code} body={r2.text[:300]}")
+            if r2.status_code == 200:
+                data2 = r2.json()
+                shipment = data2.get("shipment", {})
+                if shipment:
+                    return _parse_laposte_v2(shipment, tn)
+        except Exception as e:
+            print(f"📬 LaPoste backup exception: {e}")
+    
+    raise HTTPException(502, f"Chronopost: impossible de récupérer le suivi pour {tn}")
+
+def _parse_chronopost_xml(xml_text, tn):
+    """Parse Chronopost TrackingServiceWS XML response."""
+    import re
+    
+    # Extract events from XML
+    events = []
+    # Pattern: <event> blocks
+    event_blocks = re.findall(r'<event>(.*?)</event>', xml_text, re.DOTALL)
+    if not event_blocks:
+        # Try flat structure
+        event_blocks = re.findall(r'<listEvents>(.*?)</listEvents>', xml_text, re.DOTALL)
+    
+    for block in event_blocks:
+        code = re.search(r'<code>(.*?)</code>', block)
+        label = re.search(r'<eventLabel>(.*?)</eventLabel>', block) or re.search(r'<label>(.*?)</label>', block)
+        date_tag = re.search(r'<eventDate>(.*?)</eventDate>', block) or re.search(r'<date>(.*?)</date>', block)
+        office = re.search(r'<officeName>(.*?)</officeName>', block)
+        
+        ev_label = label.group(1) if label else ""
+        ev_code = code.group(1) if code else ""
+        ev_date_raw = date_tag.group(1) if date_tag else ""
+        ev_office = office.group(1) if office else ""
+        
+        date_val = ""; time_val = ""
+        if ev_date_raw:
+            # Format: 2026-02-26T12:11:35+01:00 or timestamp
+            if "T" in ev_date_raw:
+                date_val = ev_date_raw[:10].replace("-", "")
+                time_val = ev_date_raw[11:19].replace(":", "")
+            elif ev_date_raw.isdigit():
+                # Unix timestamp in millis
+                from datetime import datetime
+                dt = datetime.fromtimestamp(int(ev_date_raw) / 1000)
+                date_val = dt.strftime("%Y%m%d")
+                time_val = dt.strftime("%H%M%S")
+        
+        ev_type = "I"
+        ll = ev_label.lower()
+        if "livr" in ll or "distribu" in ll or "remis" in ll: ev_type = "D"
+        elif "retour" in ll or "refus" in ll or "non distribu" in ll: ev_type = "X"
+        elif "pris en charge" in ll or "déposé" in ll or "collecté" in ll: ev_type = "P"
+        
+        events.append({
+            "date": date_val, "time": time_val,
+            "status": {"type": ev_type, "description": ev_label, "code": ev_code},
+            "location": {"address": {"city": ev_office, "countryCode": "FR"}}
+        })
+    
+    # Reverse to get most recent first if needed
+    if events and events[0]["date"] and events[-1]["date"] and events[0]["date"] < events[-1]["date"]:
+        events.reverse()
+    
+    cur_type = events[0]["status"]["type"] if events else "I"
+    cur_desc = events[0]["status"]["description"] if events else "Chronopost"
+    
+    # Extract delivery date if present
+    del_date = ""
+    for ev in events:
+        if ev["status"]["type"] == "D" and ev["date"]:
+            del_date = ev["date"]; break
+    
+    normalized = {
+        "trackResponse": {"shipment": [{"service": {"description": "Chronopost"}, "pickupDate": "",
+            "package": [{"trackingNumber": tn,
+                "currentStatus": {"type": cur_type, "description": cur_desc},
+                "weight": {}, "dimension": {}, "activity": events,
+                "deliveryDate": [{"type": "RDD", "date": del_date}] if del_date else [],
+                "deliveryTime": {}, "milestones": [],
+                "packageAddress": [], "deliveryInformation": {}}]}]}
+    }
+    intel = compute_intelligence(normalized)
+    return {"carrier": "chronopost", "tracking": normalized, "timeInTransit": None,
+            "serviceDetected": {"code": "chronopost", "description": "Chronopost"},
+            "intelligence": intel, "trackAlert": {"skipped": True},
+            "_meta": {"env": "prod", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "apis": ["chronopost/ws"]}}
 
 def _parse_laposte_v2(shipment, tn):
     """Parse La Poste Suivi v2 shipment response."""
