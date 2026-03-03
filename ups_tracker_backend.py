@@ -689,62 +689,93 @@ def _parse_chronopost_xml(xml_text, tn):
     """Parse Chronopost TrackingServiceWS XML response."""
     import re
     
-    # Extract events from XML
-    events = []
-    # Pattern: <event> blocks
-    event_blocks = re.findall(r'<event>(.*?)</event>', xml_text, re.DOTALL)
-    if not event_blocks:
-        # Try flat structure
-        event_blocks = re.findall(r'<listEvents>(.*?)</listEvents>', xml_text, re.DOTALL)
+    # Extract listEvents blocks
+    event_blocks = re.findall(r'<listEvents>(.*?)</listEvents>', xml_text, re.DOTALL)
     
+    events = []
     for block in event_blocks:
         code = re.search(r'<code>(.*?)</code>', block)
-        label = re.search(r'<eventLabel>(.*?)</eventLabel>', block) or re.search(r'<label>(.*?)</label>', block)
-        date_tag = re.search(r'<eventDate>(.*?)</eventDate>', block) or re.search(r'<date>(.*?)</date>', block)
+        label = re.search(r'<eventLabel>(.*?)</eventLabel>', block)
+        date_tag = re.search(r'<eventDate>(.*?)</eventDate>', block)
         office = re.search(r'<officeName>(.*?)</officeName>', block)
+        zipcode = re.search(r'<zipCode>(.*?)</zipCode>', block)
         
-        ev_label = label.group(1) if label else ""
-        ev_code = code.group(1) if code else ""
-        ev_date_raw = date_tag.group(1) if date_tag else ""
-        ev_office = office.group(1) if office else ""
+        ev_label = label.group(1).strip() if label else ""
+        ev_code = code.group(1).strip() if code else ""
+        ev_date_raw = date_tag.group(1).strip() if date_tag else ""
+        ev_office = office.group(1).strip() if office else ""
+        ev_zip = zipcode.group(1).strip() if zipcode else ""
         
+        # Extract infoComp details (key-value pairs)
+        info_comps = re.findall(r'<infoComp>(.*?)</infoComp>', block, re.DOTALL)
+        info_dict = {}
+        for ic in info_comps:
+            ic_name = re.search(r'<name>(.*?)</name>', ic)
+            ic_val = re.search(r'<value>(.*?)</value>', ic)
+            if ic_name and ic_val:
+                info_dict[ic_name.group(1).strip()] = ic_val.group(1).strip()
+        
+        # Parse date: 2026-02-17T16:42:00+01:00
         date_val = ""; time_val = ""
         if ev_date_raw:
-            # Format: 2026-02-26T12:11:35+01:00 or timestamp
             if "T" in ev_date_raw:
                 date_val = ev_date_raw[:10].replace("-", "")
                 time_val = ev_date_raw[11:19].replace(":", "")
-            elif ev_date_raw.isdigit():
-                # Unix timestamp in millis
-                from datetime import datetime
-                dt = datetime.fromtimestamp(int(ev_date_raw) / 1000)
-                date_val = dt.strftime("%Y%m%d")
-                time_val = dt.strftime("%H%M%S")
         
+        # Map status type
         ev_type = "I"
         ll = ev_label.lower()
-        if "livr" in ll or "distribu" in ll or "remis" in ll: ev_type = "D"
-        elif "retour" in ll or "refus" in ll or "non distribu" in ll: ev_type = "X"
-        elif "pris en charge" in ll or "déposé" in ll or "collecté" in ll: ev_type = "P"
+        cc = ev_code.upper()
+        if cc in ("D", "D ") or "livraison effectu" in ll or "livré" in ll: ev_type = "D"
+        elif cc in ("DC",) or "préparation" in ll: ev_type = "P"
+        elif cc in ("EC",) or "tri effectu" in ll or "pris en charge" in ll: ev_type = "P"
+        elif "non livr" in ll or "retour" in ll or "refus" in ll: ev_type = "X"
+        elif "absent" in ll: ev_type = "X"
+        elif "acheminement" in ll or "en cours de livraison" in ll: ev_type = "I"
+        elif "point de retrait" in ll or "mis à disposition" in ll: ev_type = "I"
+        
+        # Build description with extra info
+        desc = ev_label
+        if info_dict.get("Point de retrait"):
+            desc += f" — {info_dict['Point de retrait']}"
+        elif info_dict.get("Commentaire"):
+            desc += f" ({info_dict['Commentaire']})"
+        
+        city = info_dict.get("Lieu", ev_office)
+        received_by = info_dict.get("Nom du réceptionnaire", "")
         
         events.append({
             "date": date_val, "time": time_val,
-            "status": {"type": ev_type, "description": ev_label, "code": ev_code},
-            "location": {"address": {"city": ev_office, "countryCode": "FR"}}
+            "status": {"type": ev_type, "description": desc, "code": ev_code},
+            "location": {"address": {"city": city, "countryCode": "FR"},
+                         "signedForByName": received_by}
         })
     
-    # Reverse to get most recent first if needed
+    # Most recent first
     if events and events[0]["date"] and events[-1]["date"] and events[0]["date"] < events[-1]["date"]:
         events.reverse()
     
     cur_type = events[0]["status"]["type"] if events else "I"
     cur_desc = events[0]["status"]["description"] if events else "Chronopost"
     
-    # Extract delivery date if present
+    # Delivery info
     del_date = ""
+    received_by = ""
+    relay_point = ""
     for ev in events:
         if ev["status"]["type"] == "D" and ev["date"]:
-            del_date = ev["date"]; break
+            del_date = ev["date"]
+            received_by = ev["location"].get("signedForByName", "")
+            break
+    
+    # Find pickup/relay info
+    for ev in events:
+        if "point de retrait" in ev["status"]["description"].lower():
+            relay_point = ev["status"]["description"]
+            break
+    
+    del_info = {}
+    if received_by: del_info["receivedBy"] = received_by
     
     normalized = {
         "trackResponse": {"shipment": [{"service": {"description": "Chronopost"}, "pickupDate": "",
@@ -753,7 +784,7 @@ def _parse_chronopost_xml(xml_text, tn):
                 "weight": {}, "dimension": {}, "activity": events,
                 "deliveryDate": [{"type": "RDD", "date": del_date}] if del_date else [],
                 "deliveryTime": {}, "milestones": [],
-                "packageAddress": [], "deliveryInformation": {}}]}]}
+                "packageAddress": [], "deliveryInformation": del_info}]}]}
     }
     intel = compute_intelligence(normalized)
     return {"carrier": "chronopost", "tracking": normalized, "timeInTransit": None,
