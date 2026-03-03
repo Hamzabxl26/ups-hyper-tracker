@@ -45,6 +45,23 @@ def detect_carrier(tn):
         return "ups"
     if tn.upper().startswith("1Z"):
         return "ups"
+    # Chronopost/Colissimo: XX123456789FR (2 letters + 9 digits + 2 letters ending FR)
+    if re.match(r'^[A-Z]{2}\d{9}FR$', tn, re.IGNORECASE):
+        return "chronopost"
+    # Chronopost: 13-15 digits starting with specific prefixes
+    if re.match(r'^(XY|XW|EY|XU|XH|XA)\d{9}[A-Z]{2}$', tn, re.IGNORECASE):
+        return "chronopost"
+    # Colissimo/Chronopost: 6A/6M/6L/8R/8V + digits
+    if re.match(r'^(6[AML]|8[RVL]|4[PK]|7[QA])\d{9,12}$', tn, re.IGNORECASE):
+        return "chronopost"
+    # DPD: 14 digits (most common), or 27+ digits
+    if re.match(r'^\d{14}$', tn):
+        return "dpd"
+    if re.match(r'^\d{27,}$', tn):
+        return "dpd"
+    # DPD: starts with 0 + 13 digits
+    if re.match(r'^0\d{13}$', tn):
+        return "dpd"
     # bpost: 24 digits starting with 3232 or 3299, or 13-char (2 letters + 9 digits + 2 letters)
     if re.match(r'^(3232|3299)\d{20}$', tn):
         return "bpost"
@@ -53,8 +70,8 @@ def detect_carrier(tn):
     # PostNL: 3S + country + 13 digits, or 13-digit barcode
     if re.match(r'^3S[A-Z]{2}[A-Z0-9]{9,20}$', tn, re.IGNORECASE):
         return "postnl"
-    if re.match(r'^\d{13,14}$', tn):
-        return "postnl"  # Could also be bpost, but PostNL is more common for NL
+    if re.match(r'^\d{13}$', tn):
+        return "postnl"
     # CD/CE bpost international
     if re.match(r'^(CD|CE|CZ|EE|RR|RI)\d{9}BE$', tn, re.IGNORECASE):
         return "bpost"
@@ -383,14 +400,16 @@ def track_bpost(tn, postalCode=""):
 # POSTNL
 # ══════════════════════════════════════════════════════════════
 POSTNL_API_KEY = os.environ.get("POSTNL_API_KEY", "").strip()
+POSTNL_ENV = os.environ.get("POSTNL_ENV", "sandbox").strip().lower()  # sandbox or prod
+POSTNL_BASE = "https://api-sandbox.postnl.nl" if POSTNL_ENV == "sandbox" else "https://api.postnl.nl"
 
 def track_postnl(tn, postalCode=""):
     """Track PostNL package using official ShippingStatus API."""
-    print(f"\n📊 PostNL {tn} postalCode={postalCode}")
+    print(f"\n📊 PostNL {tn} postalCode={postalCode} env={POSTNL_ENV} base={POSTNL_BASE}")
     if not POSTNL_API_KEY:
         raise HTTPException(500, "PostNL API key manquante (POSTNL_API_KEY)")
     try:
-        url = f"https://api.postnl.nl/shipment/v2/status/barcode/{tn}"
+        url = f"{POSTNL_BASE}/shipment/v2/status/barcode/{tn}"
         params = {"detail": "true"}
         headers = {
             "apikey": POSTNL_API_KEY,
@@ -531,6 +550,273 @@ def track_postnl(tn, postalCode=""):
             "serviceDetected": {"code": "postnl", "description": product},
             "intelligence": intel, "trackAlert": {"skipped": True},
             "_meta": {"env": "prod", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "apis": ["postnl/shippingstatus/v2"]}}
+
+
+# ══════════════════════════════════════════════════════════════
+# CHRONOPOST / COLISSIMO (La Poste Suivi v2)
+# ══════════════════════════════════════════════════════════════
+LAPOSTE_API_KEY = os.environ.get("LAPOSTE_API_KEY", "").strip()
+
+def track_chronopost(tn, postalCode=""):
+    """Track Chronopost/Colissimo via La Poste Suivi v2 API."""
+    print(f"\n📊 Chronopost {tn}")
+    if not LAPOSTE_API_KEY:
+        raise HTTPException(500, "Clé API La Poste manquante (LAPOSTE_API_KEY). Obtenez-la sur https://developer.laposte.fr")
+    try:
+        headers = {
+            "Accept": "application/json",
+            "X-Okapi-Key": LAPOSTE_API_KEY,
+        }
+        r = requests.get(f"https://api.laposte.fr/suivi/v2/idships/{tn}",
+                         headers=headers, timeout=15)
+        print(f"📬 Chronopost response: {r.status_code} body={r.text[:400]}")
+        
+        if r.status_code == 404:
+            raise HTTPException(404, f"Chronopost: colis {tn} non trouvé")
+        if r.status_code == 401:
+            raise HTTPException(502, "La Poste: clé API invalide")
+        if r.status_code != 200:
+            raise HTTPException(502, f"La Poste API: {r.status_code}")
+        data = r.json()
+    except HTTPException: raise
+    except Exception as e:
+        raise HTTPException(502, f"Chronopost: {str(e)}")
+
+    shipment = data.get("shipment", {})
+    if not shipment:
+        raise HTTPException(404, f"Chronopost: colis {tn} non trouvé")
+
+    # Parse events (timeline)
+    timeline = shipment.get("timeline", [])
+    events_raw = shipment.get("event", [])
+    if not isinstance(events_raw, list): events_raw = [events_raw] if events_raw else []
+
+    status_map_chrono = {
+        "LIVRE": "D", "DISTRIBUE": "D", "REMIS": "D",
+        "EN_LIVRAISON": "I", "EN_COURS_ACHEMINEMENT": "I", "ARRIVE": "I",
+        "PRIS_EN_CHARGE": "P", "DEPOSE": "P", "COLLECTE": "P",
+        "RETOUR": "X", "NON_DISTRIBUE": "X", "REFUSE": "X", "AVISE": "X",
+    }
+
+    activities = []
+    for ev in events_raw:
+        ev_date = ev.get("date", "")
+        ev_code = ev.get("code", "")
+        ev_label = ev.get("label", "")
+        date_val = ""; time_val = ""
+        if ev_date:
+            # ISO format: 2026-02-26T12:11:35+01:00
+            if "T" in ev_date:
+                date_val = ev_date[:10].replace("-", "")
+                time_val = ev_date[11:19].replace(":", "")
+            elif "/" in ev_date:
+                dp = ev_date.split(" ")
+                parts = dp[0].split("/")
+                if len(parts) == 3: date_val = parts[2] + parts[1] + parts[0]
+                if len(dp) > 1: time_val = dp[1].replace(":", "")
+
+        ev_type = "I"
+        code_upper = ev_code.upper()
+        for k, v in status_map_chrono.items():
+            if k in code_upper: ev_type = v; break
+        lbl_lower = ev_label.lower()
+        if "livré" in lbl_lower or "distribué" in lbl_lower: ev_type = "D"
+        elif "retour" in lbl_lower or "refus" in lbl_lower or "non distribu" in lbl_lower: ev_type = "X"
+        elif "pris en charge" in lbl_lower or "déposé" in lbl_lower: ev_type = "P"
+
+        activities.append({
+            "date": date_val, "time": time_val,
+            "status": {"type": ev_type, "description": ev_label, "code": ev_code},
+            "location": {"address": {"city": ev.get("location", ""), "countryCode": "FR"}}
+        })
+
+    # Current status
+    cur_status = shipment.get("status", "")
+    cur_msg = shipment.get("message", "")
+    cur_type = "I"
+    for k, v in status_map_chrono.items():
+        if k in cur_status.upper(): cur_type = v; break
+    if not cur_msg and activities:
+        cur_msg = activities[0]["status"]["description"]
+    if not cur_type and activities:
+        cur_type = activities[0]["status"]["type"]
+
+    # Delivery date
+    del_date = ""
+    delivery_date = shipment.get("deliveryDate", "")
+    if delivery_date and "T" in delivery_date:
+        del_date = delivery_date[:10].replace("-", "")
+
+    product_type = shipment.get("type", "Chronopost")
+
+    normalized = {
+        "trackResponse": {
+            "shipment": [{
+                "service": {"description": product_type},
+                "pickupDate": "",
+                "package": [{
+                    "trackingNumber": tn,
+                    "currentStatus": {"type": cur_type, "description": cur_msg or cur_status},
+                    "weight": {},
+                    "dimension": {},
+                    "activity": activities,
+                    "deliveryDate": [{"type": "RDD", "date": del_date}] if del_date else [],
+                    "deliveryTime": {},
+                    "milestones": [],
+                    "packageAddress": [],
+                    "deliveryInformation": {},
+                }]
+            }]
+        }
+    }
+
+    intel = compute_intelligence(normalized)
+    return {"carrier": "chronopost", "tracking": normalized, "timeInTransit": None,
+            "serviceDetected": {"code": "chronopost", "description": product_type},
+            "intelligence": intel, "trackAlert": {"skipped": True},
+            "_meta": {"env": "prod", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "apis": ["laposte/suivi/v2"]}}
+
+
+# ══════════════════════════════════════════════════════════════
+# DPD (Public tracking page scraping)
+# ══════════════════════════════════════════════════════════════
+def track_dpd(tn, postalCode=""):
+    """Track DPD package via public tracking page."""
+    print(f"\n📊 DPD {tn}")
+    try:
+        # DPD public tracking JSON endpoint
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+            "Referer": "https://tracking.dpd.de/status/en_US/parcel/",
+        }
+        # Try DPD.de API (works for BE/FR/EU parcels too)
+        url = f"https://tracking.dpd.de/rest/plc/en_US/{tn}"
+        r = requests.get(url, headers=headers, timeout=15)
+        print(f"📦 DPD response: {r.status_code} body={r.text[:400]}")
+
+        if r.status_code != 200 or not r.text.strip().startswith(("{", "[")):
+            # Try DPD.be/DPD.fr alternative
+            url2 = f"https://tracking.dpd.de/rest/plc/fr_FR/{tn}"
+            r = requests.get(url2, headers=headers, timeout=15)
+            print(f"📦 DPD.fr response: {r.status_code} body={r.text[:400]}")
+
+        if r.status_code != 200 or not r.text.strip().startswith(("{", "[")):
+            raise HTTPException(502, f"DPD: API non disponible ({r.status_code})")
+
+        data = r.json()
+    except HTTPException: raise
+    except Exception as e:
+        raise HTTPException(502, f"DPD: {str(e)}")
+
+    # Parse DPD ParcelLifeCycle response
+    parcel_info = data.get("parcellifecycleResponse", data)
+    if isinstance(parcel_info, dict):
+        tracking_result = parcel_info.get("getTrackingDataResponse", parcel_info.get("trackingResult", parcel_info))
+    else:
+        tracking_result = {}
+
+    status_infos = tracking_result.get("statusInfo", [])
+    if not isinstance(status_infos, list): status_infos = [status_infos] if status_infos else []
+
+    shipment_info = tracking_result.get("shipmentInfo", {})
+
+    # Build activities from statusInfo
+    activities = []
+    cur_type = "I"; cur_desc = ""
+
+    for si in status_infos:
+        si_status = si.get("status", "")
+        label = si.get("label", {})
+        label_text = label.get("content", "") if isinstance(label, dict) else str(label)
+        desc_obj = si.get("description", {})
+        desc_text = ""
+        if isinstance(desc_obj, dict):
+            content_list = desc_obj.get("content", [])
+            if isinstance(content_list, list):
+                desc_text = " ".join(c.get("content", "") if isinstance(c, dict) else str(c) for c in content_list).strip()
+            elif isinstance(content_list, str):
+                desc_text = content_list
+        elif isinstance(desc_obj, str):
+            desc_text = desc_obj
+
+        is_current = si.get("isCurrentStatus", False)
+        is_reached = si.get("statusHasBeenReached", False)
+        loc_obj = si.get("location", {}) or {}
+        loc_city = loc_obj.get("content", {}).get("content", "") if isinstance(loc_obj.get("content"), dict) else ""
+        date_obj = si.get("date", {}) or {}
+        date_text = ""
+        if isinstance(date_obj, dict):
+            date_content = date_obj.get("content", "")
+            if isinstance(date_content, dict): date_text = date_content.get("content", "")
+            elif isinstance(date_content, str): date_text = date_content
+        elif isinstance(date_obj, str): date_text = date_obj
+
+        # Parse date
+        date_val = ""; time_val = ""
+        if date_text:
+            date_text = date_text.strip()
+            if "T" in date_text:
+                date_val = date_text[:10].replace("-", "")
+                if len(date_text) > 11: time_val = date_text[11:19].replace(":", "")
+            elif "." in date_text:
+                parts = date_text.split(" ")
+                dp = parts[0].split(".")
+                if len(dp) == 3: date_val = dp[2] + dp[1] + dp[0]
+                if len(parts) > 1: time_val = parts[1].replace(":", "")
+
+        # Map status
+        ev_type = "I"
+        sl = si_status.lower()
+        if sl in ("delivered", "delivery"): ev_type = "D"
+        elif sl in ("betweendepots", "intransit", "transit", "indepot", "ontheway"): ev_type = "I"
+        elif sl in ("shipment", "pickup", "collected"): ev_type = "P"
+        elif sl in ("exception", "returned", "notdelivered"): ev_type = "X"
+        ll = label_text.lower()
+        if "delivered" in ll or "livré" in ll or "zugestellt" in ll: ev_type = "D"
+        elif "returned" in ll or "retour" in ll: ev_type = "X"
+
+        if is_reached or is_current:
+            activities.append({
+                "date": date_val, "time": time_val,
+                "status": {"type": ev_type, "description": desc_text or label_text, "code": si_status},
+                "location": {"address": {"city": loc_city, "countryCode": ""}}
+            })
+
+        if is_current:
+            cur_type = ev_type
+            cur_desc = desc_text or label_text
+
+    if not cur_desc and activities:
+        cur_desc = activities[0]["status"]["description"]
+        cur_type = activities[0]["status"]["type"]
+
+    normalized = {
+        "trackResponse": {
+            "shipment": [{
+                "service": {"description": "DPD"},
+                "pickupDate": "",
+                "package": [{
+                    "trackingNumber": tn,
+                    "currentStatus": {"type": cur_type, "description": cur_desc},
+                    "weight": {},
+                    "dimension": {},
+                    "activity": activities,
+                    "deliveryDate": [],
+                    "deliveryTime": {},
+                    "milestones": [],
+                    "packageAddress": [],
+                    "deliveryInformation": {},
+                }]
+            }]
+        }
+    }
+
+    intel = compute_intelligence(normalized)
+    return {"carrier": "dpd", "tracking": normalized, "timeInTransit": None,
+            "serviceDetected": {"code": "dpd", "description": "DPD"},
+            "intelligence": intel, "trackAlert": {"skipped": True},
+            "_meta": {"env": "prod", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "apis": ["dpd/tracking"]}}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -752,6 +1038,8 @@ def track(tracking_number: str, carrier: str = Query(default=""), postalCode: st
     print(f"\n🔍 Track {tracking_number} → carrier={c} postalCode={pc}")
     if c == "bpost": return track_bpost(tracking_number, pc)
     if c == "postnl": return track_postnl(tracking_number, pc)
+    if c == "chronopost": return track_chronopost(tracking_number, pc)
+    if c == "dpd": return track_dpd(tracking_number, pc)
     return track_ups(tracking_number)
 
 @app.get("/api/detect/{tracking_number}")
@@ -763,8 +1051,9 @@ def detect(tracking_number: str):
 def health():
     return {"status": "ok", "ups_env": UPS_ENV, "has_credentials": bool(CLIENT_ID and CLIENT_SECRET),
             "webhook_configured": bool(WEBHOOK_URL), "telegram": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT),
-            "postnl_key": bool(POSTNL_API_KEY),
-            "carriers": ["ups", "bpost", "postnl"],
+            "postnl_key": bool(POSTNL_API_KEY), "postnl_env": POSTNL_ENV,
+            "laposte_key": bool(LAPOSTE_API_KEY),
+            "carriers": ["ups", "bpost", "postnl", "chronopost", "dpd"],
             "active_sse_clients": len(sse_clients), "notifications_count": len(notifications),
             "watchlist_count": len(server_watchlist), "polling": "30min"}
 
@@ -829,6 +1118,10 @@ async def poll_watchlist():
                     result = track_bpost(tn, pc)
                 elif carrier == "postnl":
                     result = track_postnl(tn, pc)
+                elif carrier == "chronopost":
+                    result = track_chronopost(tn, pc)
+                elif carrier == "dpd":
+                    result = track_dpd(tn, pc)
                 else:
                     result = track_ups(tn)
                 
@@ -911,13 +1204,16 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
     print("=" * 60)
-    print("🚀 RAYHANN_EXPLORER CORREOS — UPS + bpost + PostNL + Telegram")
+    print("🚀 RAYHANN_EXPLORER CORREOS")
+    print("   UPS · bpost · PostNL · Chronopost · DPD")
     print("=" * 60)
-    print(f"   UPS       : {'✅' if CLIENT_ID else '❌'} ({UPS_ENV.upper()})")
-    print(f"   bpost     : ✅ (public API)")
-    print(f"   PostNL    : {'✅ key=' + POSTNL_API_KEY[:8] + '...' if POSTNL_API_KEY else '❌ POSTNL_API_KEY manquante'}")
-    print(f"   Webhook   : {'✅' if WEBHOOK_URL else '❌'}")
-    print(f"   Telegram  : {'✅ Chat ' + TELEGRAM_CHAT if TELEGRAM_TOKEN else '❌'}")
-    print(f"   Port      : {port}")
+    print(f"   UPS        : {'✅' if CLIENT_ID else '❌'} ({UPS_ENV.upper()})")
+    print(f"   bpost      : ✅ (public API)")
+    print(f"   PostNL     : {'✅ ' + POSTNL_ENV.upper() + ' key=' + POSTNL_API_KEY[:8] + '...' if POSTNL_API_KEY else '❌ POSTNL_API_KEY manquante'}")
+    print(f"   Chronopost : {'✅ key=' + LAPOSTE_API_KEY[:8] + '...' if LAPOSTE_API_KEY else '❌ LAPOSTE_API_KEY manquante'}")
+    print(f"   DPD        : ✅ (public API)")
+    print(f"   Webhook    : {'✅' if WEBHOOK_URL else '❌'}")
+    print(f"   Telegram   : {'✅ Chat ' + TELEGRAM_CHAT if TELEGRAM_TOKEN else '❌'}")
+    print(f"   Port       : {port}")
     print("=" * 60)
     uvicorn.run(app, host="0.0.0.0", port=port)
