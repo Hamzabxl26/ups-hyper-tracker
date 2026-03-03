@@ -1,5 +1,5 @@
-requests>=2.32
-fastapi>=0.129
-uvicorn>=0.40
-pydantic>=2.12
-python-dotenv>=1.2
+fastapi==0.115.0
+uvicorn==0.30.6
+requests==2.32.3
+python-dotenv==1.0.1
+sse-starlette>=2.0
