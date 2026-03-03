@@ -404,38 +404,55 @@ POSTNL_ENV = os.environ.get("POSTNL_ENV", "sandbox").strip().lower()  # sandbox 
 POSTNL_BASE = "https://api-sandbox.postnl.nl" if POSTNL_ENV == "sandbox" else "https://api.postnl.nl"
 
 def track_postnl(tn, postalCode=""):
-    """Track PostNL package using official ShippingStatus API."""
+    """Track PostNL package using official ShippingStatus API or public tracking."""
     print(f"\n📊 PostNL {tn} postalCode={postalCode} env={POSTNL_ENV} base={POSTNL_BASE}")
-    if not POSTNL_API_KEY:
-        raise HTTPException(500, "PostNL API key manquante (POSTNL_API_KEY)")
+    
+    # Method 1: Official API (if key available)
+    if POSTNL_API_KEY:
+        try:
+            url = f"{POSTNL_BASE}/shipment/v2/status/barcode/{tn}"
+            params = {"detail": "true"}
+            headers = {"apikey": POSTNL_API_KEY, "Accept": "application/json"}
+            r = requests.get(url, params=params, headers=headers, timeout=15)
+            print(f"🟠 PostNL API response: {r.status_code} body={r.text[:400]}")
+            
+            if r.status_code == 200 and r.text.strip().startswith("{"):
+                data = r.json()
+                if not data.get("Errors"):
+                    return _parse_postnl_api(data, tn, postalCode)
+                else:
+                    print(f"🟠 PostNL API errors: {data.get('Errors')}")
+            elif r.status_code in (401, 403):
+                print(f"🟠 PostNL API auth error: {r.status_code}")
+        except Exception as e:
+            print(f"🟠 PostNL API exception: {e}")
+    
+    # Method 2: Public tracking page (fallback)
     try:
-        url = f"{POSTNL_BASE}/shipment/v2/status/barcode/{tn}"
-        params = {"detail": "true"}
         headers = {
-            "apikey": POSTNL_API_KEY,
             "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
         }
-        r = requests.get(url, params=params, headers=headers, timeout=15)
-        print(f"🟠 PostNL response: {r.status_code} body={r.text[:400]}")
+        # PostNL public track API
+        pub_url = f"https://jouw.postnl.nl/track-and-trace/{tn}/NL/{postalCode}"
+        # Actually use the internal API
+        api_url = f"https://jouw.postnl.nl/api/TrackAndTrace/GetStatusData?barcode={tn}&countryCode=NL&postalCode={postalCode}&language=nl"
+        r2 = requests.get(api_url, headers=headers, timeout=15)
+        print(f"🟠 PostNL public response: {r2.status_code} body={r2.text[:400]}")
         
-        if r.status_code == 404:
-            raise HTTPException(404, f"PostNL: colis {tn} non trouvé")
-        if r.status_code == 401:
-            raise HTTPException(502, "PostNL: clé API invalide")
-        if r.status_code != 200:
-            raise HTTPException(502, f"PostNL API: {r.status_code}")
-        data = r.json()
-    except HTTPException: raise
+        if r2.status_code == 200 and r2.text.strip().startswith("{"):
+            return _parse_postnl_public(r2.json(), tn, postalCode)
     except Exception as e:
-        raise HTTPException(502, f"PostNL: {str(e)}")
+        print(f"🟠 PostNL public exception: {e}")
+    
+    raise HTTPException(502, f"PostNL: impossible de récupérer le suivi pour {tn}. Vérifiez le code postal.")
 
-    # Parse PostNL ShippingStatus response
+def _parse_postnl_api(data, tn, postalCode):
+    """Parse PostNL official API ShippingStatus response."""
     shipment = {}
     current_status = data.get("CurrentStatus", {})
     if current_status:
         shipment = current_status.get("Shipment", {})
-    
-    # Complete status has all events
     complete = data.get("CompleteStatus", {})
     if complete:
         shipment = complete.get("Shipment", shipment)
@@ -549,7 +566,76 @@ def track_postnl(tn, postalCode=""):
     return {"carrier": "postnl", "tracking": normalized, "timeInTransit": None,
             "serviceDetected": {"code": "postnl", "description": product},
             "intelligence": intel, "trackAlert": {"skipped": True},
-            "_meta": {"env": "prod", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "apis": ["postnl/shippingstatus/v2"]}}
+            "_meta": {"env": POSTNL_ENV, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "apis": ["postnl/shippingstatus/v2"]}}
+
+def _parse_postnl_public(data, tn, postalCode):
+    """Parse PostNL public tracking page JSON response."""
+    # Public API returns different structure
+    colli = data.get("colli", {}).get(tn, data.get("colli", {}))
+    if isinstance(colli, dict) and tn in colli:
+        colli = colli[tn]
+    if not isinstance(colli, dict):
+        # Try first value
+        colli_dict = data.get("colli", {})
+        if isinstance(colli_dict, dict) and colli_dict:
+            colli = next(iter(colli_dict.values()), {})
+        else:
+            colli = {}
+    
+    status_phase = colli.get("statusPhase", {}) or {}
+    cur_desc = status_phase.get("message", colli.get("status", ""))
+    
+    # Determine type
+    phase = status_phase.get("phase", 0)
+    cur_type = "I"
+    if phase >= 4: cur_type = "D"
+    elif phase == 0: cur_type = "P"
+    
+    events = colli.get("history", []) or []
+    activities = []
+    for ev in events:
+        ev_date = ev.get("dateTime", "")
+        date_val = ""; time_val = ""
+        if ev_date and "T" in ev_date:
+            date_val = ev_date[:10].replace("-", "")
+            time_val = ev_date[11:19].replace(":", "")
+        ev_desc = ev.get("status", "")
+        ev_type = "I"
+        dl = ev_desc.lower()
+        if "bezorgd" in dl or "delivered" in dl or "afgeleverd" in dl: ev_type = "D"
+        elif "onderweg" in dl or "gesorteerd" in dl: ev_type = "I"
+        elif "aangemeld" in dl or "ontvangen" in dl: ev_type = "P"
+        activities.append({
+            "date": date_val, "time": time_val,
+            "status": {"type": ev_type, "description": ev_desc, "code": ""},
+            "location": {"address": {"city": ev.get("location", ""), "countryCode": "NL"}}
+        })
+    
+    exp_del = colli.get("expectedDeliveryDate", "") or colli.get("deliveryDate", "")
+    del_date = exp_del[:10].replace("-", "") if exp_del and "T" in exp_del else ""
+    
+    normalized = {
+        "trackResponse": {
+            "shipment": [{
+                "service": {"description": "PostNL"},
+                "pickupDate": "",
+                "package": [{
+                    "trackingNumber": tn,
+                    "currentStatus": {"type": cur_type, "description": cur_desc or "PostNL"},
+                    "weight": {}, "dimension": {},
+                    "activity": activities,
+                    "deliveryDate": [{"type": "RDD", "date": del_date}] if del_date else [],
+                    "deliveryTime": {}, "milestones": [], "packageAddress": [],
+                    "deliveryInformation": {},
+                }]
+            }]
+        }
+    }
+    intel = compute_intelligence(normalized)
+    return {"carrier": "postnl", "tracking": normalized, "timeInTransit": None,
+            "serviceDetected": {"code": "postnl", "description": "PostNL"},
+            "intelligence": intel, "trackAlert": {"skipped": True},
+            "_meta": {"env": "public", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "apis": ["postnl/public"]}}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -681,30 +767,35 @@ def track_chronopost(tn, postalCode=""):
 # DPD (Public tracking page scraping)
 # ══════════════════════════════════════════════════════════════
 def track_dpd(tn, postalCode=""):
-    """Track DPD package via public tracking page."""
+    """Track DPD package via public tracking API."""
     print(f"\n📊 DPD {tn}")
     try:
-        # DPD public tracking JSON endpoint
         headers = {
             "Accept": "application/json",
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
             "Referer": "https://tracking.dpd.de/status/en_US/parcel/",
         }
-        # Try DPD.de API (works for BE/FR/EU parcels too)
-        url = f"https://tracking.dpd.de/rest/plc/en_US/{tn}"
-        r = requests.get(url, headers=headers, timeout=15)
-        print(f"📦 DPD response: {r.status_code} body={r.text[:400]}")
-
-        if r.status_code != 200 or not r.text.strip().startswith(("{", "[")):
-            # Try DPD.be/DPD.fr alternative
-            url2 = f"https://tracking.dpd.de/rest/plc/fr_FR/{tn}"
-            r = requests.get(url2, headers=headers, timeout=15)
-            print(f"📦 DPD.fr response: {r.status_code} body={r.text[:400]}")
-
-        if r.status_code != 200 or not r.text.strip().startswith(("{", "[")):
-            raise HTTPException(502, f"DPD: API non disponible ({r.status_code})")
-
-        data = r.json()
+        
+        data = None
+        # Try multiple DPD endpoints
+        endpoints = [
+            f"https://tracking.dpd.de/rest/plc/en_US/{tn}",
+            f"https://tracking.dpd.de/rest/plc/fr_FR/{tn}",
+            f"https://tracking.dpd.de/rest/plc/nl_NL/{tn}",
+        ]
+        
+        for url in endpoints:
+            try:
+                r = requests.get(url, headers=headers, timeout=15)
+                print(f"📦 DPD {url.split('/')[-2]}: {r.status_code} ct={r.headers.get('content-type','')} body={r.text[:200]}")
+                if r.status_code == 200 and r.text.strip().startswith(("{", "[")):
+                    data = r.json()
+                    break
+            except:
+                continue
+        
+        if not data:
+            raise HTTPException(502, f"DPD: colis {tn} non trouvé ou API non disponible")
     except HTTPException: raise
     except Exception as e:
         raise HTTPException(502, f"DPD: {str(e)}")
