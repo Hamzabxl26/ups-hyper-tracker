@@ -400,52 +400,59 @@ def track_bpost(tn, postalCode=""):
 # POSTNL
 # ══════════════════════════════════════════════════════════════
 POSTNL_API_KEY = os.environ.get("POSTNL_API_KEY", "").strip()
-POSTNL_ENV = os.environ.get("POSTNL_ENV", "sandbox").strip().lower()  # sandbox or prod
+POSTNL_ENV = os.environ.get("POSTNL_ENV", "sandbox").strip().lower()
 POSTNL_BASE = "https://api-sandbox.postnl.nl" if POSTNL_ENV == "sandbox" else "https://api.postnl.nl"
 
 def track_postnl(tn, postalCode=""):
-    """Track PostNL package using official ShippingStatus API or public tracking."""
-    print(f"\n📊 PostNL {tn} postalCode={postalCode} env={POSTNL_ENV} base={POSTNL_BASE}")
+    """Track PostNL package using jouw.postnl.nl public API (primary) or official API (backup)."""
+    print(f"\n📊 PostNL {tn} postalCode={postalCode}")
     
-    # Method 1: Official API (if key available)
-    if POSTNL_API_KEY:
-        try:
-            url = f"{POSTNL_BASE}/shipment/v2/status/barcode/{tn}"
-            params = {"detail": "true"}
-            headers = {"apikey": POSTNL_API_KEY, "Accept": "application/json"}
-            r = requests.get(url, params=params, headers=headers, timeout=15)
-            print(f"🟠 PostNL API response: {r.status_code} body={r.text[:400]}")
-            
-            if r.status_code == 200 and r.text.strip().startswith("{"):
-                data = r.json()
-                if not data.get("Errors"):
-                    return _parse_postnl_api(data, tn, postalCode)
-                else:
-                    print(f"🟠 PostNL API errors: {data.get('Errors')}")
-            elif r.status_code in (401, 403):
-                print(f"🟠 PostNL API auth error: {r.status_code}")
-        except Exception as e:
-            print(f"🟠 PostNL API exception: {e}")
+    # Build identifier: barcode-countryCode-postalCode
+    # Try to detect country from postalCode
+    country = "NL"
+    if postalCode:
+        # Belgian postal codes are 4 digits, Dutch are 4 digits + 2 letters
+        if postalCode.isdigit() and len(postalCode) == 4:
+            country = "BE"
+        elif len(postalCode) >= 6:
+            country = "NL"
     
-    # Method 2: Public tracking page (fallback)
+    identifier = f"{tn}-{country}-{postalCode}" if postalCode else tn
+    
+    # Method 1: jouw.postnl.nl public track API (no auth needed!)
     try:
+        url = f"https://jouw.postnl.nl/track-and-trace/api/trackAndTrace/{identifier}?language=nl"
         headers = {
             "Accept": "application/json",
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
         }
-        # PostNL public track API
-        pub_url = f"https://jouw.postnl.nl/track-and-trace/{tn}/NL/{postalCode}"
-        # Actually use the internal API
-        api_url = f"https://jouw.postnl.nl/api/TrackAndTrace/GetStatusData?barcode={tn}&countryCode=NL&postalCode={postalCode}&language=nl"
-        r2 = requests.get(api_url, headers=headers, timeout=15)
-        print(f"🟠 PostNL public response: {r2.status_code} body={r2.text[:400]}")
+        r = requests.get(url, headers=headers, timeout=15)
+        print(f"🟠 PostNL public: {r.status_code} size={len(r.text)} body={r.text[:300]}")
         
-        if r2.status_code == 200 and r2.text.strip().startswith("{"):
-            return _parse_postnl_public(r2.json(), tn, postalCode)
+        if r.status_code == 200 and r.text.strip().startswith("{"):
+            data = r.json()
+            colli = data.get("colli", {})
+            if colli:
+                return _parse_postnl_public(data, tn, postalCode)
     except Exception as e:
         print(f"🟠 PostNL public exception: {e}")
     
-    raise HTTPException(502, f"PostNL: impossible de récupérer le suivi pour {tn}. Vérifiez le code postal.")
+    # Method 2: Official API (backup, needs key + only own shipments)
+    if POSTNL_API_KEY:
+        try:
+            url2 = f"{POSTNL_BASE}/shipment/v2/status/barcode/{tn}"
+            params = {"detail": "true"}
+            headers2 = {"apikey": POSTNL_API_KEY, "Accept": "application/json"}
+            r2 = requests.get(url2, params=params, headers=headers2, timeout=15)
+            print(f"🟠 PostNL API: {r2.status_code} body={r2.text[:300]}")
+            if r2.status_code == 200 and r2.text.strip().startswith("{"):
+                data2 = r2.json()
+                if not data2.get("Errors"):
+                    return _parse_postnl_api(data2, tn, postalCode)
+        except Exception as e:
+            print(f"🟠 PostNL API exception: {e}")
+    
+    raise HTTPException(502, f"PostNL: impossible de récupérer le suivi pour {tn}. Vérifiez barcode + code postal.")
 
 def _parse_postnl_api(data, tn, postalCode):
     """Parse PostNL official API ShippingStatus response."""
@@ -569,73 +576,166 @@ def _parse_postnl_api(data, tn, postalCode):
             "_meta": {"env": POSTNL_ENV, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "apis": ["postnl/shippingstatus/v2"]}}
 
 def _parse_postnl_public(data, tn, postalCode):
-    """Parse PostNL public tracking page JSON response."""
-    # Public API returns different structure
-    colli = data.get("colli", {}).get(tn, data.get("colli", {}))
-    if isinstance(colli, dict) and tn in colli:
-        colli = colli[tn]
+    """Parse jouw.postnl.nl track-and-trace API response (rich JSON)."""
+    colli_dict = data.get("colli", {})
+    # Find the right colli entry (key may be barcode without suffix)
+    colli = None
+    for key, val in colli_dict.items():
+        if tn.startswith(key) or key.startswith(tn):
+            colli = val; break
+    if not colli:
+        colli = next(iter(colli_dict.values()), {}) if colli_dict else {}
     if not isinstance(colli, dict):
-        # Try first value
-        colli_dict = data.get("colli", {})
-        if isinstance(colli_dict, dict) and colli_dict:
-            colli = next(iter(colli_dict.values()), {})
-        else:
-            colli = {}
+        raise HTTPException(404, f"PostNL: colis {tn} non trouvé")
     
+    # --- Status ---
     status_phase = colli.get("statusPhase", {}) or {}
-    cur_desc = status_phase.get("message", colli.get("status", ""))
+    phase_index = status_phase.get("index", 0)
+    phase_msg = status_phase.get("message", "")
     
-    # Determine type
-    phase = status_phase.get("phase", 0)
     cur_type = "I"
-    if phase >= 4: cur_type = "D"
-    elif phase == 0: cur_type = "P"
+    is_delivered = colli.get("isDelivered", False)
+    if is_delivered or phase_index >= 4: cur_type = "D"
+    elif phase_index <= 1: cur_type = "P"
     
-    events = colli.get("history", []) or []
+    # --- Observations (events) ---
+    # Use allObservations from analyticsInfo (most complete) or fallback to observations
+    analytics = colli.get("analyticsInfo", {}) or {}
+    all_obs = analytics.get("allObservations", []) or colli.get("observations", []) or []
+    
     activities = []
-    for ev in events:
-        ev_date = ev.get("dateTime", "")
+    for obs in reversed(all_obs):  # Reverse to get most recent first
+        obs_date = obs.get("observationDate", "")
+        obs_code = obs.get("observationCode", "")
+        obs_desc = obs.get("description", "")
+        
         date_val = ""; time_val = ""
-        if ev_date and "T" in ev_date:
-            date_val = ev_date[:10].replace("-", "")
-            time_val = ev_date[11:19].replace(":", "")
-        ev_desc = ev.get("status", "")
+        if obs_date and "T" in obs_date:
+            date_val = obs_date[:10].replace("-", "")
+            time_val = obs_date[11:19].replace(":", "")
+        
+        # Map observation codes to status types
         ev_type = "I"
-        dl = ev_desc.lower()
-        if "bezorgd" in dl or "delivered" in dl or "afgeleverd" in dl: ev_type = "D"
-        elif "onderweg" in dl or "gesorteerd" in dl: ev_type = "I"
-        elif "aangemeld" in dl or "ontvangen" in dl: ev_type = "P"
+        oc = obs_code.upper()
+        if oc.startswith("A01") or oc.startswith("A0"): ev_type = "P"  # Pre-announced
+        elif oc.startswith("B"): ev_type = "P"  # Received by PostNL
+        elif oc.startswith("J") or oc.startswith("H"): ev_type = "I"  # Sorting/transit
+        elif oc.startswith("D") or oc.startswith("I"): ev_type = "D"  # Delivered
+        elif oc.startswith("N") or oc.startswith("F"): ev_type = "X"  # Not delivered
+        # Also check description
+        dl = obs_desc.lower()
+        if "bezorgd" in dl or "afgeleverd" in dl or "uitgereikt" in dl: ev_type = "D"
+        elif "niet bezorgd" in dl or "retour" in dl: ev_type = "X"
+        
         activities.append({
             "date": date_val, "time": time_val,
-            "status": {"type": ev_type, "description": ev_desc, "code": ""},
-            "location": {"address": {"city": ev.get("location", ""), "countryCode": "NL"}}
+            "status": {"type": ev_type, "description": obs_desc, "code": obs_code},
+            "location": {"address": {"city": "", "countryCode": colli.get("recipient", {}).get("address", {}).get("country", "NL")}}
         })
     
-    exp_del = colli.get("expectedDeliveryDate", "") or colli.get("deliveryDate", "")
-    del_date = exp_del[:10].replace("-", "") if exp_del and "T" in exp_del else ""
+    # --- ETA / delivery window ---
+    eta = colli.get("eta", {}) or {}
+    eta_start = eta.get("start", "")
+    eta_end = eta.get("end", "")
+    del_date = ""
+    if is_delivered:
+        dd = colli.get("deliveryDate", "")
+        if dd and "T" in dd: del_date = dd[:10].replace("-", "")
+    elif eta_start and "T" in eta_start:
+        del_date = eta_start[:10].replace("-", "")
+    
+    # Delivery time range
+    del_time = {}
+    if eta_start and eta_end:
+        del_time = {"startTime": eta_start[11:16] if "T" in eta_start else "",
+                     "endTime": eta_end[11:16] if "T" in eta_end else ""}
+    
+    # --- Recipient / Sender ---
+    recipient = colli.get("recipient", {}) or {}
+    sender = colli.get("sender", {}) or {}
+    rec_names = recipient.get("names", {}) or {}
+    rec_addr = recipient.get("address", {}) or {}
+    snd_names = sender.get("names", {}) or {}
+    snd_addr = sender.get("address", {}) or {}
+    
+    addresses = []
+    if rec_addr.get("town"):
+        addresses.append({"type": "DELIVERY", "address": {
+            "city": rec_addr.get("town", ""), "countryCode": rec_addr.get("country", ""),
+            "postalCode": rec_addr.get("postalCode", ""),
+            "addressLine1": f"{rec_addr.get('street', '')} {rec_addr.get('houseNumber', '')}".strip()
+        }})
+    
+    # --- Dimensions / Weight ---
+    dims = (colli.get("details", {}) or {}).get("dimensions", {}) or {}
+    weight = {"weight": dims.get("weight", "")} if dims.get("weight") else {}
+    dimension = {}
+    if dims.get("height"):
+        dimension = {"height": dims.get("height"), "width": dims.get("width"), "length": dims.get("depth")}
+    
+    # --- Product info ---
+    details = colli.get("details", {}) or {}
+    product_code = details.get("productCode", "")
+    is_belgian = details.get("isBelgianProduct", False)
+    product_desc = f"PostNL {'Belgium' if is_belgian else 'NL'} ({product_code})" if product_code else "PostNL"
+    
+    # --- Delivery info ---
+    del_info = {}
+    if colli.get("deliveryAddressType"): del_info["type"] = colli["deliveryAddressType"]
+    if colli.get("hasProofOfDelivery"): del_info["proofOfDelivery"] = True
+    if colli.get("isAtRetailLocation"): del_info["atRetailLocation"] = True
+    
+    # --- Reroute options ---
+    reroute = colli.get("rerouteOptions", {}) or {}
     
     normalized = {
         "trackResponse": {
             "shipment": [{
-                "service": {"description": "PostNL"},
+                "service": {"description": product_desc},
                 "pickupDate": "",
                 "package": [{
-                    "trackingNumber": tn,
-                    "currentStatus": {"type": cur_type, "description": cur_desc or "PostNL"},
-                    "weight": {}, "dimension": {},
+                    "trackingNumber": colli.get("barcode", tn),
+                    "currentStatus": {"type": cur_type, "description": phase_msg or "PostNL"},
+                    "weight": weight, "dimension": dimension,
                     "activity": activities,
                     "deliveryDate": [{"type": "RDD", "date": del_date}] if del_date else [],
-                    "deliveryTime": {}, "milestones": [], "packageAddress": [],
-                    "deliveryInformation": {},
+                    "deliveryTime": del_time,
+                    "milestones": [],
+                    "packageAddress": addresses,
+                    "deliveryInformation": del_info,
+                    "expectedDeliveryTimeRange": {
+                        "day": eta_start[:10] if eta_start else "",
+                        "time1": eta_start[11:16] if "T" in (eta_start or "") else "",
+                        "time2": eta_end[11:16] if "T" in (eta_end or "") else "",
+                    } if eta_start else {},
                 }]
             }]
         }
     }
+    
     intel = compute_intelligence(normalized)
+    
     return {"carrier": "postnl", "tracking": normalized, "timeInTransit": None,
-            "serviceDetected": {"code": "postnl", "description": "PostNL"},
+            "serviceDetected": {"code": "postnl", "description": product_desc},
             "intelligence": intel, "trackAlert": {"skipped": True},
-            "_meta": {"env": "public", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "apis": ["postnl/public"]}}
+            "_meta": {
+                "env": "public", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "apis": ["postnl/jouw.postnl.nl"],
+                "raw_postnl": {
+                    "sender": {"name": snd_names.get("companyName") or snd_names.get("personName", ""),
+                               "address": f"{snd_addr.get('street','')} {snd_addr.get('houseNumber','')}, {snd_addr.get('postalCode','')} {snd_addr.get('town','')}".strip(", ")},
+                    "receiver": {"name": rec_names.get("personName") or rec_names.get("companyName", ""),
+                                 "address": f"{rec_addr.get('street','')} {rec_addr.get('houseNumber','')}, {rec_addr.get('postalCode','')} {rec_addr.get('town','')}".strip(", ")},
+                    "eta": eta,
+                    "statusPhase": status_phase,
+                    "isDelivered": is_delivered,
+                    "isBelgianProduct": is_belgian,
+                    "deliveryPreferences": details.get("deliveryPreferences", {}),
+                    "rerouteOptions": reroute,
+                    "isReturnShipment": colli.get("isReturnShipment", False),
+                    "isSustainableDelivery": colli.get("isSustainableDelivery", False),
+                    "lastObservation": colli.get("lastObservation", ""),
+                }}}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1471,7 +1571,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"   UPS        : {'✅' if CLIENT_ID else '❌'} ({UPS_ENV.upper()})")
     print(f"   bpost      : ✅ (public API)")
-    print(f"   PostNL     : {'✅ ' + POSTNL_ENV.upper() + ' key=' + POSTNL_API_KEY[:8] + '...' if POSTNL_API_KEY else '❌ POSTNL_API_KEY manquante'}")
+    print(f"   PostNL     : ✅ jouw.postnl.nl (public){' + API ' + POSTNL_ENV.upper() + ' key=' + POSTNL_API_KEY[:8] + '...' if POSTNL_API_KEY else ''}")
     print(f"   Chronopost : {'✅ key=' + LAPOSTE_API_KEY[:8] + '...' if LAPOSTE_API_KEY else '❌ LAPOSTE_API_KEY manquante'}")
     print(f"   DPD        : ✅ (public API)")
     print(f"   Webhook    : {'✅' if WEBHOOK_URL else '❌'}")
