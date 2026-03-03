@@ -789,15 +789,15 @@ def _parse_chronopost_xml(xml_text, tn):
     """Parse Chronopost TrackingServiceWS XML response."""
     import re
     
-    # Extract listEvents blocks
-    event_blocks = re.findall(r'<listEvents>(.*?)</listEvents>', xml_text, re.DOTALL)
+    # Real SOAP structure: <listEventInfoComp><events>...</events></listEventInfoComp>
+    event_blocks = re.findall(r'<events>(.*?)</events>', xml_text, re.DOTALL)
     
     events = []
     for block in event_blocks:
         code = re.search(r'<code>(.*?)</code>', block)
         label = re.search(r'<eventLabel>(.*?)</eventLabel>', block)
         date_tag = re.search(r'<eventDate>(.*?)</eventDate>', block)
-        office = re.search(r'<officeName>(.*?)</officeName>', block)
+        office = re.search(r'<officeLabel>(.*?)</officeLabel>', block)
         zipcode = re.search(r'<zipCode>(.*?)</zipCode>', block)
         
         ev_label = label.group(1).strip() if label else ""
@@ -806,10 +806,10 @@ def _parse_chronopost_xml(xml_text, tn):
         ev_office = office.group(1).strip() if office else ""
         ev_zip = zipcode.group(1).strip() if zipcode else ""
         
-        # Extract infoComp details (key-value pairs)
-        info_comps = re.findall(r'<infoComp>(.*?)</infoComp>', block, re.DOTALL)
+        # Extract infoCompList pairs: <infoCompList><n>X</n><value>Y</value></infoCompList>
+        info_blocks = re.findall(r'<infoCompList>(.*?)</infoCompList>', block, re.DOTALL)
         info_dict = {}
-        for ic in info_comps:
+        for ic in info_blocks:
             ic_name = re.search(r'<name>(.*?)</name>', ic)
             ic_val = re.search(r'<value>(.*?)</value>', ic)
             if ic_name and ic_val:
